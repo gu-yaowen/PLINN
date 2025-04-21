@@ -1,0 +1,44 @@
+batch_size: 256
+epochs: 100
+device: cuda
+seed: 42
+num_run: 1
+verbose: true
+split_seed: 0
+save_dir: ./dumped/test_bace/
+model:
+  backbone: gps
+  num_layer: 5
+  emb_dim: 300
+  heads: 6
+  layernorm: true
+  dropout_ratio: 0
+  attn_dropout_ratio: 0.3
+  temperature: 0.5
+  use_prompt: true
+  normalize: false
+  checkpoint: ./checkpoint/zinc-gnn_best.pt
+optim:
+  prompt_lr: 0.0005
+  pretrain_lr: 0.0005
+  finetune_lr: 0.0001
+  decay: 1.0e-06
+  gradient_clip: 5
+  scheduler: cos_anneal
+prompt_optim:
+  skip_bo: true
+  inits:
+  - 0.0
+  - 0.0
+  - 0.0
+dataset:
+  data_dir: ./your/data/path
+  data_name: bace
+  split_type: customized
+  custom_train_path: ./data/finetune/bace_train.csv
+  custom_val_path: ./data/finetune/bace_val.csv
+  custom_test_path: ./data/finetune/bace_test.csv
+  num_workers: 0
+  feat_type: super_rich
+  task: classification
+  loss_func: MAE

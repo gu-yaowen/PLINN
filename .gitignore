@@ -1,0 +1,20 @@
+# Ignore a specific file
+model_test.ipynb
+
+# Ignore all .log files
+*.ipynb
+*.pkl
+*.sbatch
+# *.sh
+*.out
+# *.csv
+
+# Ignore a specific directory
+result/
+data/
+scripts/
+__pycache__/
+
+# Ignore all .txt files in a specific directory
+*/__pycache__/
+
