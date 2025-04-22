@@ -11,6 +11,7 @@ model_test.ipynb
 
 # Ignore a specific directory
 result/
+wandb/
 data/
 scripts/
 __pycache__/

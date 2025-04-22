@@ -41,6 +41,9 @@ class PLINN(nn.Module):
         pred_input_dim = config['LigEncoder']['emb_dim'] \
                         + config['ProtEncoder']['emb_dim'] \
                         + config['PLI']['emb_dim'] * 2
+        # pred_input_dim = config['LigEncoder']['emb_dim'] \
+        #                 + config['ProtEncoder']['emb_dim']
+        # pred_input_dim = config['LigEncoder']['emb_dim']
         self.classifier = nn.Sequential(
             nn.Linear(pred_input_dim, int(pred_input_dim / 2)),
             nn.ReLU(),
@@ -60,9 +63,6 @@ class PLINN(nn.Module):
         # combine two dict
         output.update(prot_output)
 
-        lig_graph_rep = output['lig_graph_rep']
-        prot_output_rep = output['prot_global_rep']
-
         pli_output = self.PLI(
                             output['lig_node_rep'],    # L: [B, A, D]
                             output['prot_node_rep'],   # P: [B, R, D]
@@ -73,9 +73,10 @@ class PLINN(nn.Module):
         output.update(pli_output)
 
         # concate all the embeddings
-        pli_emb = torch.cat([lig_graph_rep, prot_output_rep, 
+        pli_emb = torch.cat([output['lig_graph_rep'], output['prot_global_rep'], 
                              output['lig_pli'], output['prot_pli']], dim=1)
-
+        # pli_emb = torch.cat([lig_graph_rep, prot_output_rep], dim=1)
+        
         # apply classifier
         pred = self.classifier(pli_emb)
         return pred, output
