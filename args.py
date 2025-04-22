@@ -43,8 +43,6 @@ def add_args():
                             help='Number of attention heads in the model')
     argparser.add_argument('--layernorm', type=bool, default=True,
                             help='Whether to use layer normalization in the model')
-    argparser.add_argument('--batchnorm', type=bool, default=True,
-                            help='Whether to use batch normalization in the model')
     argparser.add_argument('--dropout_ratio', type=float, default=0,
                             help='Dropout ratio in the model')
     args = argparser.parse_args()
@@ -61,6 +59,8 @@ def generate_yaml_config(args,
                          checkpoint="./checkpoint/zinc-gps_best.pt", # download the pre-trained model from the MolMCL github
                          output_path=None):
     config = {
+        "mode_type": args.mode_type,
+        "model_path": args.model_path,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "device": "cuda" if args.gpu else "cpu",
@@ -91,7 +91,6 @@ def generate_yaml_config(args,
             "num_layer": args.num_layer,
             "heads": args.heads,
             "layernorm": args.layernorm,
-            "batchnorm": args.batchnorm,
             "dropout_ratio": args.dropout_ratio,
         },
         "PLI": {
@@ -99,7 +98,6 @@ def generate_yaml_config(args,
             "emb_dim": 300,
             "heads": args.heads,
             "layernorm": args.layernorm,
-            "batchnorm": args.batchnorm,
             "dropout_ratio": args.dropout_ratio,
         },
         "optim": {

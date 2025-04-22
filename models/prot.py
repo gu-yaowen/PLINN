@@ -10,14 +10,13 @@ class ProtSeq(nn.Module):
         in_dim  = config['ProtEncoder']['input_dim']
         hid_dim = config['ProtEncoder']['emb_dim']
         n_layer = config['ProtEncoder']['num_layer']
+        n_layer = 2
         for i in range(n_layer):
             dim_in = in_dim if i == 0 else hid_dim
             self.prot_encoder.append(nn.Linear(dim_in, hid_dim))
 
         self.dropout = nn.Dropout(config['ProtEncoder']['dropout_ratio'])
         self.layernorm = nn.LayerNorm(hid_dim) if config['ProtEncoder']['layernorm'] else None
-        self.batchnorm = nn.BatchNorm1d(hid_dim) if config['ProtEncoder']['batchnorm'] else None
-
         # self-attention aggregation
         self.attn = nn.MultiheadAttention(hid_dim, config['ProtEncoder']['heads'], batch_first=True)
         # pooling with mask
@@ -31,15 +30,10 @@ class ProtSeq(nn.Module):
             emb_P = layer(emb_P)           # still [B, R, D]
             if self.layernorm:
                 emb_P = self.layernorm(emb_P)
-            if self.batchnorm:
-                # feed [B, D, R] into BatchNorm1d
-                emb_P = emb_P.permute(0, 2, 1)
-                emb_P = self.batchnorm(emb_P)
-                emb_P = emb_P.permute(0, 2, 1)
             emb_P = F.relu(emb_P)
             emb_P = self.dropout(emb_P)
         global_out, _ = self.attn(emb_P, emb_P, emb_P, key_padding_mask=~mask_P)
-        output['prot_global_rep'] = self.pool(emb_P, mask_P)
+        output['prot_global_rep'] = self.pool(global_out, mask_P)
         output['prot_node_rep'] = emb_P
         output['mask_P'] = mask_P
         return output

@@ -26,3 +26,20 @@ def get_protein_embedding(config, dataset):
             continue
     print('Total proteins:', len(t_emb_dict))
     return t_emb_dict
+
+def filter_by_prot_length(dataset, prot_emb_dict, max_len=2000):
+    """
+    Filter the dataset by protein length.
+    :param dataset: The dataset to filter.
+    :param prot_emb_dict: The protein embedding dictionary.
+    :param max_len: The maximum length of the protein sequence.
+    :return: The filtered dataset.
+    """
+    t_list = dataset['target'].unique()
+    filter_t = []
+    for t in t_list:
+        if len(prot_emb_dict[t][0]) > max_len:
+            filter_t.append(t)
+    filtered_dataset = dataset[~dataset['target'].isin(filter_t)].reset_index(drop=True)
+    print(f'Filtered out {len(filter_t)} targets with protein length > {max_len}')
+    return filtered_dataset

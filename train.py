@@ -11,21 +11,23 @@ from rdkit import Chem
 import yaml
 from tqdm import tqdm
 from collections import OrderedDict
+import shutup; shutup.please()
 import torch
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_dense_batch
 from sklearn.metrics import roc_auc_score, r2_score, mean_squared_error
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from models.model import PLINN
-from train.loader import MoleculeDataset, batch_P
-from train.prompt_optim import optimize_prompt_weight_ri as optimize_prompt_weight_ri_
+from utils.loader import MoleculeDataset, batch_P
+from utils.prompt_optim import optimize_prompt_weight_ri as optimize_prompt_weight_ri_
 from utils.scheduler import PolynomialDecayLR
-from utils.utils import get_protein_embedding
-import shutup; shutup.please()
+from utils.utils import get_protein_embedding, filter_by_prot_length
+
 
 class RMSELoss(nn.Module):
     def __init__(self):
@@ -79,9 +81,10 @@ def get_dataloader(config):
     smiles_col = 'SMILES'
     target_col = 'target'
     labels_col = 'y_cls'
-
+    
     df = pd.concat([df_train, df_val, df_test], axis=0)
     prot_emb_dict = get_protein_embedding(config, df)
+    df_train = filter_by_prot_length(df_train, prot_emb_dict)
 
     dataset = MoleculeDataset(df_train[smiles_col], 
                               df_train[target_col],
@@ -129,15 +132,15 @@ def eval(model, val_loader, prot_emb_dict, config, metric='rmse'):
         y_scores.append(predict)
 
     y_true = torch.cat(y_true, dim=0).cpu().numpy()
-    y_scores = torch.cat(y_scores, dim=0).cpu().numpy()
-    roc_list = []
-    for i in range(y_true.shape[1]):
-        # AUC is only defined when there is at least one positive data.
-        if np.sum(y_true[:, i] == 1) > 0 and np.sum(y_true[:, i] == -1) > 0:
-            is_valid = y_true[:, i] ** 2 > 0
-            roc_list.append(roc_auc_score((y_true[is_valid, i] + 1) / 2, y_scores[is_valid, i]))
-
-    score = np.mean(roc_list)
+    if config['dataset']['task'] == 'regression':
+        if metric == 'rmse':
+            score = np.sqrt(mean_squared_error(y_true, y_scores))
+        elif metric == 'r2':
+            score = r2_score(y_true, y_scores)
+    elif config['dataset']['task'] == 'classification':
+        # sigmoid output
+        y_scores = torch.sigmoid(torch.cat(y_scores, dim=0)).cpu().numpy()
+        score = roc_auc_score(y_true, y_scores)
 
     return score
 
@@ -146,33 +149,36 @@ def train(model, train_loader, prot_emb_dict, criterion, optimizer, scheduler, c
     model.train()
     loss_history = []
     channel_weight = 0
-    for idx, batch_lig in enumerate(train_loader):
+    scaler = GradScaler()
+
+    for idx, batch_lig in tqdm(enumerate(train_loader), total=len(train_loader)):
         batch_prot = batch_P(config, batch_lig, prot_emb_dict)
         batch_lig.to(config['device'])
-        predict, _ = model(batch_lig, batch_prot, channel_idx=channel_idx)
-        label = batch_lig.label.view(predict.shape)
+        with autocast():
+            predict, _ = model(batch_lig, batch_prot, channel_idx=channel_idx)
+            label = batch_lig.label.view(predict.shape)
 
-        if isinstance(criterion, nn.BCEWithLogitsLoss):
-            mask = label == 0  # nan entry
-            loss = criterion(predict.double(), (label + 1) / 2) * (~mask)
-            loss = loss.sum() / (~mask).sum()
-        elif isinstance(criterion, nn.MSELoss):
-            loss = criterion(predict, label)
-            loss = loss.mean()
-        elif isinstance(criterion, RMSELoss):  # Include RMSELoss here
-            loss = criterion(predict, label)
-            loss = loss.mean()
-        elif isinstance(criterion, nn.L1Loss):  # Include MAE here
-            loss = criterion(predict, label)
-            loss = loss.mean()
-        else:
-            raise Exception("Unsupported loss function")
+            if isinstance(criterion, nn.BCEWithLogitsLoss):
+                loss = criterion(predict, label)
+                loss = loss.mean()
+            elif isinstance(criterion, nn.MSELoss):
+                loss = criterion(predict, label)
+                loss = loss.mean()
+            elif isinstance(criterion, RMSELoss):  # Include RMSELoss here
+                loss = criterion(predict, label)
+                loss = loss.mean()
+            elif isinstance(criterion, nn.L1Loss):  # Include MAE here
+                loss = criterion(predict, label)
+                loss = loss.mean()
+            else:
+                raise Exception("Unsupported loss function")
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
         if config['optim']['gradient_clip'] > 0:
             nn.utils.clip_grad_norm_(model.parameters(), config['optim']['gradient_clip'])
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         if config['optim']['scheduler'] == 'poly_decay':
             scheduler.step()
@@ -277,9 +283,11 @@ def main(config):
     else:
         print('No checkpoint provided. Initializing model from scratch.')
     model.to(config['device'])
+    # calculate number of parameters
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters: {num_params / 1e6:.2f}M")
 
     # Train prompt:
-    # NOTE: unfinished
     if config['LigEncoder']['use_prompt']:
         if best_initialization is None:
             best_initialization = optimize_prompt_weight_ri(model, train_loader, val_loader, config)
@@ -333,7 +341,7 @@ def main(config):
         csv_writer.writerow(["epoch", "train_score", "val_score", "test_score"])  # Header row
     
 
-    for epoch in tqdm(range(1, config['epochs'] + 1)):
+    for epoch in range(1, config['epochs'] + 1):
         # train one epoch
         train(model, train_loader, prot_emb_dict, criterion, optimizer, scheduler, config)
         # evaluate validation
@@ -377,7 +385,7 @@ def main(config):
         print('Prompt weight of last checkpoint:', model.get_prompt_weight('softmax').data.cpu())
 
     #model.load_state_dict(best_checkpoint)
-    score_best_checkpoint = eval(model, test_loader, config)
+    score_best_checkpoint = eval(model, test_loader, prot_emb_dict, config)
     #avg_auc_best.append(score_best_checkpoint)
     if config['LigEncoder']['use_prompt']:
         print('Prompt weight of best checkpoint:', model.get_prompt_weight('softmax').data.cpu())
@@ -394,4 +402,5 @@ if __name__ == '__main__':
         config = yaml.load(f, Loader=yaml.FullLoader)
 
     print(config)
-    main(config)
+    if config['mode_type'] in ['train', 'retrain']:
+        main(config)

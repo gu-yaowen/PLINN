@@ -35,7 +35,6 @@ class PLINN(nn.Module):
                                       hidden_dim=config['PLI']['emb_dim'],
                                       num_heads=config['PLI']['heads'],
                                       dropout=config['PLI']['dropout_ratio'],
-                                      use_batchnorm=config['PLI']['batchnorm'],
                                       use_layernorm=config['PLI']['layernorm']
                                      )
         
