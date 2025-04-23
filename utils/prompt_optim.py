@@ -86,7 +86,7 @@ def get_next_points(init_x, init_y, best_init_y, bounds, n_points=1, n_restarts=
     return candidates
 
 
-def optimize_prompt_weight_ri(graph_reps, labels, n_runs, n_inits, n_points, n_restarts, n_samples, temperature, metric,
+def optimize_prompt_weight_ri_(graph_reps, labels, n_runs, n_inits, n_points, n_restarts, n_samples, temperature, metric,
                               skip_bo=False, verbose=False):
     start_time = time.time()
     n_channels = graph_reps.size(0)

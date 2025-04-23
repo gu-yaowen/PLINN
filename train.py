@@ -10,9 +10,11 @@ from collections import OrderedDict
 import wandb
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from torch_geometric.loader import DataLoader
+from torch_geometric.utils import to_dense_batch
 from sklearn.metrics import (
     mean_squared_error, r2_score, roc_auc_score,
     average_precision_score, accuracy_score,
@@ -23,6 +25,7 @@ from tqdm import tqdm
 from models.model import PLINN
 from utils.loader import MoleculeDataset, batch_P
 from utils.utils import get_protein_embedding, filter_by_prot_length
+from utils.prompt_optim import optimize_prompt_weight_ri_
 from utils.scheduler import PolynomialDecayLR
 os.environ["WANDB_MODE"]="offline"
 
@@ -95,6 +98,54 @@ def get_dataloaders(config: dict):
     return train_loader, val_loader, test_loader, prot_emb_dict
 
 
+def optimize_prompt_weight_ri(model, train_loader, val_loader, config, metric='euclidean', act='softmax', max_num=5000):
+    temperature = config['model']['temperature']
+    skip_bo = config['prompt_optim']['skip_bo']
+
+    num = 0
+    model.eval()
+    graph_rep_list, label_list = [], []
+    for loader in [train_loader, val_loader]:
+        if loader is None:
+            continue
+        for batch in loader:
+            batch.to(config['device'])
+            with torch.no_grad():
+                graph_reps = []
+                if model.backbone == 'gps':
+                    h_g, node_repres = model.LigEncoder.gnn(batch.x, 
+                                        batch.pe, batch.edge_index, batch.edge_attr, batch.batch)
+                else:
+                    h_g, node_repres = model.LigEncoder.gnn(batch.x, 
+                                        batch.edge_index, batch.edge_attr, batch.batch)
+                # map back to batched nodes for aggregation
+                batch_x, batch_mask = to_dense_batch(node_repres, batch.batch)
+                # conditional aggregation given the prompt_inds
+                for i in range(len(model.prompt_token)):
+                    h_g, h_x, _ = model.aggrs[i](batch_x, batch_mask)
+                    if config['model']['normalize']:
+                        h_g = F.normalize(h_g, dim=-1)
+                    graph_reps.append(h_g)
+
+            graph_reps_batch = torch.stack(graph_reps)
+            labels_batch = batch.label.view(-1, model.num_tasks)
+
+            is_valid = (labels_batch != 0).sum(-1) == labels_batch.size(1)
+            graph_rep_list.append(graph_reps_batch[:, is_valid])
+            label_list.append(labels_batch[is_valid])
+
+            num += graph_rep_list[-1].size(1)
+            if num > max_num:
+                break
+
+    graph_reps = torch.concat(graph_rep_list, dim=1).cpu()  # (num_prompt, N, emb_dim)
+    labels = torch.concat(label_list, dim=0).cpu()  # (N, 1)
+
+    return optimize_prompt_weight_ri_(graph_reps, labels, n_runs=50, n_inits=50, n_points=5, n_restarts=512,
+                                      n_samples=512, temperature=temperature, metric=metric,
+                                      skip_bo=skip_bo, verbose=config['verbose'])
+
+
 def eval_model(model: nn.Module, loader: DataLoader, prot_emb_dict: dict, 
                device: str, task: str, dataset: str):
     model.eval()
@@ -140,20 +191,32 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, prot_emb_dict: dict,
     loss_history = []
     # channel_weight = 0
     for batch in tqdm(loader, desc='Training'):
-        batch.to(config['device'])
+        batch = batch.to(device, non_blocking=True)
         batch_prot = batch_P({'device': device}, batch, prot_emb_dict)
-        with autocast():
+        if scaler is not None:
+            optimizer.zero_grad()
+            with autocast():
+                predict, _ = model(batch, batch_prot)
+                label = batch.label.view(predict.shape).to(predict.dtype)
+                loss = criterion(predict, (label + 1) / 2)
+                loss = loss.mean()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             predict, _ = model(batch, batch_prot)
-            label = batch.label.view(predict.shape)
-            loss = criterion(predict.double(), (label + 1) / 2)
+            label = batch.label.view(predict.shape).to(predict.dtype)
+            loss = criterion(predict, (label + 1) / 2)
             loss = loss.mean()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        if config['optim']['gradient_clip'] > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), config['optim']['gradient_clip'])
-        scaler.step(optimizer)
-        scaler.update()
-
+            optimizer.zero_grad()
+            loss.backward()
+            if config['optim']['gradient_clip'] > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), config['optim']['gradient_clip'])
+            optimizer.step()
+    
+        # if config['optim']['gradient_clip'] > 0:
+        #     nn.utils.clip_grad_norm_(model.parameters(), config['optim']['gradient_clip'])
         if config['optim']['scheduler'] == 'poly_decay':
             scheduler.step()
         loss_history.append(loss.item())
@@ -177,7 +240,6 @@ def main(config):
     model = PLINN(config, *{
         'basic': (None, None), 'rich': (143, 14), 'super_rich': (170, 14)
     }[config['dataset']['feat_type']])
-    model.to(device)
 
     wandb.watch(model, log='all', log_freq=100) # NOTE
 
@@ -196,6 +258,19 @@ def main(config):
     print(model)
     print('Number of parameters:', 
           sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, 'M')
+
+    best_initialization = None
+    if config['prompt_optim']['inits']:
+        best_initialization = torch.Tensor(config['prompt_optim']['inits'])
+    if config['LigEncoder']['use_prompt']:
+        if best_initialization is None:
+            best_initialization = optimize_prompt_weight_ri(model, train_loader, val_loader, config)
+        model.LigEncoder.set_prompt_weight(best_initialization.to(config['device']))
+        # if args.verbose and use_prompt:
+        initial_prompt_probs = model.LigEncoder.get_prompt_weight('softmax').data.cpu()
+        initial_prompt_weights = model.LigEncoder.get_prompt_weight('none').data.cpu()
+        print('Initial prompt weight:', initial_prompt_weights)
+        print('Initial prompt prob:  ', initial_prompt_probs)
 
     optimizer = get_optimizer(model, config['optim'])
     if config['optim']['scheduler'] == 'cos_anneal':
@@ -230,8 +305,8 @@ def main(config):
         writer.writerow(header)
 
     best_score = float('inf') if config['dataset']['task']=='regression' else -float('inf')
-
-    scaler = GradScaler()
+    
+    scaler = GradScaler() if config['amp'] == True else None
     # resume_path = config.get('resume_from_checkpoint', None)
     # if resume_path and os.path.isfile(resume_path):
     #     ckpt = torch.load(resume_path, map_location=device)
@@ -303,6 +378,8 @@ def main(config):
         if is_best:
             torch.save(model.state_dict(), os.path.join(config['save_dir'],'best.pt'))
 
+        if config['LigEncoder']['use_prompt']:
+            print('Prompt weight of last checkpoint:', model.LigEncoder.get_prompt_weight('softmax').data.cpu())
         one_epoch_time = time.time() - time1
         approximate_time_to_end = (config['epochs'] - epoch) * one_epoch_time
         if config.get('verbose', False):

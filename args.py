@@ -59,6 +59,7 @@ def generate_yaml_config(args,
                          checkpoint="./checkpoint/zinc-gps_best.pt", # download the pre-trained model from the MolMCL github
                          output_path=None):
     config = {
+        "amp": True,
         "mode_type": args.mode_type,
         "model_path": args.model_path,
         "batch_size": args.batch_size,
